@@ -11,16 +11,35 @@ from .metrics import *
 from .losses import *
 
 
+class BasicModel():
+    def __init__(self,model): self.model=model
+    def get_layer_groups(self): return children(self.model)
+
+class SingleModel(BasicModel):
+    def get_layer_groups(self): return [self.model]
+
+
 class Learner():
     def __init__(self, data, models, opt_fn=None, tmp_name='tmp', models_name='models', metrics=None):
         self.data_,self.models,self.metrics = data,models,metrics
         self.sched=None
+        self.clip = None
         self.opt_fn = opt_fn or SGD_Momentum(0.9)
         self.tmp_path = os.path.join(self.data.path, tmp_name)
-        if not os.path.exists(self.tmp_path): os.mkdir(self.tmp_path)
         self.models_path = os.path.join(self.data.path, models_name)
-        if not os.path.exists(self.models_path): os.mkdir(self.models_path)
-        self.crit = None
+        if not os.path.exists(self.tmp_path):
+            try:
+                os.mkdir(self.tmp_path)
+                if not os.path.exists(self.models_path): os.mkdir(self.models_path)
+            except IOError:
+                print(f'directory {self.tmp_path} is not writable')
+            else:
+                self.tmp_path = os.path.join(os.getenv("HOME"), tmp_name)
+                if not os.path.exists(self.tmp_path): os.mkdir(self.tmp_path)
+                self.models_path = os.path.join(os.getenv("HOME"), models_name)
+                if not os.path.exists(self.models_path): os.mkdir(self.models_path)
+
+        self.crit,self.reg_fn,self.crit = None,None,None
 
     def num_features(self): return num_features(self.model)
 
@@ -56,7 +75,7 @@ class Learner():
     def load_cycle(self, name, cycle): self.load(f'{name}_cyc_{cycle}')
 
     def fit_gen(self, model, data, layer_opt, n_cycle, cycle_len=None, cycle_mult=1, cycle_save_name=None,
-                metrics=None, callbacks=None):
+                metrics=None, callbacks=None, **kwargs):
         if callbacks is None: callbacks=[]
         if metrics is None: metrics=self.metrics
         if cycle_len:
@@ -67,9 +86,10 @@ class Learner():
         callbacks+=[self.sched]
         for cb in callbacks: cb.on_train_begin()
         n_epoch = sum_geom(cycle_len if cycle_len else 1, cycle_mult, n_cycle)
-        fit(model, data, n_epoch, self.crit, layer_opt.opt, metrics, callbacks)
+        fit(model, data, n_epoch, layer_opt.opt, self.crit,
+            metrics=metrics, callbacks=callbacks, reg_fn=self.reg_fn, clip=self.clip, **kwargs)
 
-    def get_layer_groups(self): return self.children
+    def get_layer_groups(self): return self.models.get_layer_groups()
 
     def get_layer_opt(self, lrs, wds):
         return LayerOptimizer(self.opt_fn, self.get_layer_groups(), lrs, wds)
@@ -86,14 +106,17 @@ class Learner():
         self.fit_gen(self.model, self.data, layer_opt, 1)
         self.load('tmp')
 
-    def predict(self, is_test=False):
+    def predict(self, is_test=False): return self.predict_with_targs(is_test)[0]
+
+    def predict_with_targs(self, is_test=False):
         dl = self.data.test_dl if is_test else self.data.val_dl
-        return to_np(predict(self.model, dl))
+        return predict_with_targs(self.model, dl)
 
     def TTA(self, n_aug=4, is_test=False):
         dl1 = self.data.test_dl     if is_test else self.data.val_dl
         dl2 = self.data.test_aug_dl if is_test else self.data.aug_dl
         preds1,targs = predict_with_targs(self.model, dl1)
-        preds1 = [to_np(preds1)]*math.ceil(n_aug/4)
-        preds2 = [to_np(predict(self.model, dl2)) for i in range(n_aug)]
-        return np.stack(preds1+preds2).mean(0), to_np(targs)
+        preds1 = [preds1]*math.ceil(n_aug/4)
+        preds2 = [predict_with_targs(self.model, dl2)[0] for i in range(n_aug)]
+        return np.stack(preds1+preds2).mean(0), targs
+
